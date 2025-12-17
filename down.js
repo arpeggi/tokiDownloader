@@ -99,6 +99,74 @@ async function saveImage(page, path, fileName, src) {
     fs.writeFileSync(`${path}/${fileName}`, Buffer.from(imageBuffer));
 }
 
+async function waitForCaptchaSolved(page, site) {
+    // 페이지 로드 후 일정 시간 대기 (캡차가 나타날 시간을 줌)
+    await sleep(3000);
+    
+    // 예상되는 콘텐츠가 나타나는지 확인
+    const hasContent = await page.evaluate((siteType) => {
+        if (siteType === 'booktoki') {
+            // 북토끼: #novel_content가 있는지 확인
+            return !!document.querySelector('#novel_content');
+        } else {
+            // 뉴토끼, 마나토끼: .view-padding div img가 있는지 확인
+            const images = document.querySelectorAll('.view-padding div img');
+            return images.length > 0;
+        }
+    }, site);
+    
+    // 콘텐츠가 없으면 캡차일 가능성이 높음
+    if (!hasContent) {
+        consoleRed(`⚠️  캡차가 감지되었습니다. 브라우저에서 캡차를 해결해주세요...`);
+        consoleGrey('캡차를 해결하면 자동으로 계속 진행됩니다.');
+        
+        // 콘텐츠가 나타날 때까지 대기
+        let contentLoaded = false;
+        let attempts = 0;
+        const maxAttempts = 600; // 최대 10분 대기 (1초 * 600)
+        
+        while (!contentLoaded && attempts < maxAttempts) {
+            await sleep(1000);
+            attempts++;
+            
+            // 콘텐츠가 로드되었는지 확인
+            contentLoaded = await page.evaluate((siteType) => {
+                if (siteType === 'booktoki') {
+                    const content = document.querySelector('#novel_content');
+                    return content && content.innerText.length > 50; // 텍스트가 충분히 있는지
+                } else {
+                    const images = document.querySelectorAll('.view-padding div img');
+                    // 이미지가 있고, 최소 하나는 보이는지 확인
+                    if (images.length > 0) {
+                        for (let img of images) {
+                            if (img.checkVisibility && img.checkVisibility()) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }, site);
+            
+            if (attempts % 10 === 0) {
+                consoleGrey(`대기 중... (${attempts}초 경과)`);
+            }
+        }
+        
+        if (contentLoaded) {
+            console.log('✅ 캡차가 해결되었습니다. 계속 진행합니다.');
+            await sleep(2000); // 페이지가 완전히 로드될 때까지 추가 대기
+            return true; // 콘텐츠를 찾았음을 반환
+        } else {
+            consoleRed('⏱️  캡차 대기 시간이 초과되었습니다. 계속 진행합니다.');
+            return false; // 콘텐츠를 찾지 못했음을 반환
+        }
+    }
+    
+    // 이미 콘텐츠가 있으면 true 반환
+    return true;
+}
+
 async function main() {
     const { browser, page } = await connect({
         headless: false,
@@ -156,6 +224,16 @@ async function main() {
             await Promise.all([page.goto(link[i].src), page.waitForNavigation()]);
             await sleep(2000);
             console.log(`${link[i].num} ${link[i].fileName} 진행중`);
+            
+            // 캡차가 있는지 확인하고 해결될 때까지 대기
+            const contentFound = await waitForCaptchaSolved(page, info.site);
+            
+            // 콘텐츠를 찾지 못했으면 이 회차를 건너뜀
+            if (!contentFound) {
+                consoleRed(`⚠️  ${link[i].num} ${link[i].fileName} - 콘텐츠를 찾을 수 없어 건너뜁니다.`);
+                continue;
+            }
+            
             // 북토끼
             if (info.site === "booktoki") {
                 await page.locator('#novel_content').wait();
@@ -170,7 +248,13 @@ async function main() {
             }
             // 뉴토끼, 마나토끼
             else {
-                await page.waitForSelector('.view-padding div img');
+                // waitForCaptchaSolved에서 이미 콘텐츠를 확인했지만, 추가로 안전하게 대기
+                try {
+                    await page.waitForSelector('.view-padding div img', { timeout: 10000 });
+                } catch (error) {
+                    // 타임아웃이 발생해도 계속 진행 (이미 waitForCaptchaSolved에서 확인했으므로)
+                    consoleGrey('이미지 셀렉터 대기 중 타임아웃, 계속 진행합니다...');
+                }
                 // 이미지 가져오기
                 let imgLists = await page.evaluate(() => {
                     // view-padding의 div의 img.
